@@ -1,3 +1,4 @@
+import frappe
 from erpnext.accounts.doctype.subscription.subscription import Subscription
 import frappe
 import frappe
@@ -26,112 +27,22 @@ from erpnext.accounts.party import get_party_account_currency
 from datetime import datetime
 
 DateTimeLikeObject = str | date
+from typing import Dict, List, Optional, Union
 
 
 class SubscriptionInvoice(Subscription):
-
-    # @frappe.whitelist()
-    # def generate_invoices_to_today(self) -> None:
-    #     """
-    #     Generates invoices from the beginning of the subscription to today
-    #     at monthly intervals if no invoices have been generated for that period.
-    #     """
-    #     start_date = getdate(self.start_date)
-    #     today = getdate(nowdate())
-    #     current_date = start_date
-
-    # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@222 create one each two month
-
-    @frappe.whitelist()
-    def generate_invoices_to_today(self) -> None:
-        """
-        Generates invoices from the beginning of the subscription to today
-        at monthly intervals if no invoices have been generated for that period.
-        """
-        start_date = getdate(self.start_date)
-        today = getdate(nowdate())
-        current_date = start_date
-
-        while current_date <= today:
-            if not self.is_invoice_generated_for_date(current_date):
-                self.generate_invoice(
-                    from_date=current_date, to_date=add_months(current_date, 1)
-                )
-            current_date = add_months(current_date, 1)
-
-    def is_invoice_generated_for_date(self, date: DateTimeLikeObject) -> bool:
-        """
-        Checks if an invoice has been generated for the given date.
-        """
-        invoices = frappe.get_all(
-            self.invoice_document_type,
-            filters={
-                "subscription": self.name,
-                "from_date": ("<=", date),
-                "to_date": (">=", date),
-            },
-            pluck="name",
-        )
-        return bool(invoices)
-
-    @frappe.whitelist()
-    def create_invoice1(
+    def create_past_missing_invoices(
         self,
-        from_date: DateTimeLikeObject | None = None,
-        to_date: DateTimeLikeObject | None = None,
-        posting_date: DateTimeLikeObject | None = None,
+        from_date: Optional[Union[str, datetime.date]] = None,
+        to_date: Optional[Union[str, datetime.date]] = None,
+        posting_date: Optional[Union[str, datetime.date]] = None,
     ) -> Document:
-        """
-        Creates a `Invoice`, submits it and returns it
-        """
-        # set the start date to the beginning of the subscription
-        start_date = getdate(self.start_date)
-        # Set the end date to today's date
-        end_date = date.today()
 
-        # get all existing invoices for the subscription
-        existing_invoices = frappe.get_all(
-            "Sales Invoice",
-            filters={"subscription": self.name},
-            fields=["posting_date"],
-        )
-
-        invoices_month = {
-            getdate(invoice.posting_date).strftime("%Y-%m")
-            for invoice in existing_invoices
-        }
-        print("posting date is", existing_invoices)
-
-        # Initialize the invoice date to the start date
-        invoice_date = start_date
-
-        # Iterate from the start date to today's date with a monthly interval
-        while invoice_date < end_date:
-            invoice_month = invoice_date.strftime("%Y-%m")
-            if invoice_month not in invoices_month:
-                to_date = get_last_day(invoice_date)
-                # Generate invoice if not already existing
-                self._create_single_invoice(invoice_date, to_date)
-
-            # Move to the next month
-            invoice_date = add_months(invoice_date, 1)
-
-        # generate the current invoice as per existing logic
-        return self._create_single_invoice(from_date, to_date)
-
-    def _create_single_invoice(
-        self,
-        from_date: DateTimeLikeObject | None = None,
-        to_date: DateTimeLikeObject | None = None,
-    ) -> Document:
-        """
-        Helper method to create a single invoice
-        """
         company = self.get("company") or get_default_company()
         if not company:
             frappe.throw(
                 _(
-                    "Company is mandatory for generating an invoice. Please set a default company in Global Defaults."
+                    "Company is mandatory when generating invoice. Please set default company in Global Defaults."
                 )
             )
 
@@ -139,7 +50,15 @@ class SubscriptionInvoice(Subscription):
         invoice.company = company
         invoice.set_posting_time = 1
 
-        invoice.posting_date = from_date or self.current_invoice_start
+        if self.generate_invoice_at == "Beginning of the current subscription period":
+            invoice.posting_date = from_date or self.current_invoice_start
+        elif self.generate_invoice_at == "Days before the current subscription period":
+            invoice.posting_date = posting_date or add_days(
+                from_date or self.current_invoice_start, -self.number_of_days
+            )
+        else:
+            invoice.posting_date = to_date or self.current_invoice_end
+
         invoice.cost_center = self.cost_center
 
         if self.invoice_document_type == "Sales Invoice":
@@ -149,29 +68,21 @@ class SubscriptionInvoice(Subscription):
             if frappe.db.get_value("Supplier", self.party, "tax_withholding_category"):
                 invoice.apply_tds = 1
 
-        # Add party currency to invoice
         invoice.currency = get_party_account_currency(
             self.party_type, self.party, self.company
         )
 
-        # Add dimensions in invoice for subscription:
         accounting_dimensions = get_accounting_dimensions()
-
         for dimension in accounting_dimensions:
             if self.get(dimension):
                 invoice.update({dimension: self.get(dimension)})
 
-        # Subscription is better suited for service items. I won't update `update_stock`
-        # for that reason
         items_list = self.get_items_from_plans(self.plans, is_prorate())
-
         for item in items_list:
             item["cost_center"] = self.cost_center
             invoice.append("items", item)
 
-        # Taxes
         tax_template = ""
-
         if self.invoice_document_type == "Sales Invoice" and self.sales_tax_template:
             tax_template = self.sales_tax_template
         if (
@@ -184,7 +95,6 @@ class SubscriptionInvoice(Subscription):
             invoice.taxes_and_charges = tax_template
             invoice.set_taxes()
 
-        # Due date
         if self.days_until_due:
             invoice.append(
                 "payment_schedule",
@@ -196,7 +106,6 @@ class SubscriptionInvoice(Subscription):
                 },
             )
 
-        # Discounts
         if self.is_trialling():
             invoice.additional_discount_percentage = 100
         else:
@@ -214,7 +123,11 @@ class SubscriptionInvoice(Subscription):
                     discount_on if discount_on else "Grand Total"
                 )
 
-        # Subscription period
+        # Adjust the current invoice start and end dates based on the latest invoice
+        if from_date and to_date:
+            self.current_invoice_start = from_date
+            self.current_invoice_end = to_date
+
         invoice.subscription = self.name
         invoice.from_date = from_date or self.current_invoice_start
         invoice.to_date = to_date or self.current_invoice_end
@@ -227,7 +140,58 @@ class SubscriptionInvoice(Subscription):
         if self.submit_invoice:
             invoice.submit()
 
+        return invoice
 
-# #         return invoice
+    @frappe.whitelist()
+    def fetch_past_subscription_invoices(self):
+        """fetch and create any missing invoices for the subscription"""
+        name1 = "ACC-SUB-2024-00028"
+
+        ## get existing invoices for the subscription
+        invoices = frappe.get_all(
+            "Sales Invoice",
+            filters={"subscription": self.name},
+            fields=["posting_date"],
+        )
+
+        # Create a list of (month, year) for existing invoices
+        invoices_month = [getdate(x.posting_date).month for x in invoices]
+        invoices_year = [getdate(x.posting_date).year for x in invoices]
+
+        # Initialize start date of subscription and current dates
+        start_date = getdate(self.start_date)
+        current_date = getdate(nowdate())
+        result = 0
+
+        # Loop through each month from the start date to the current date
+        while start_date < current_date:
+            next_to_date = start_date
+            # If  invoice does not exist for a particular month and year, create one
+            if not (
+                start_date.month in invoices_month and start_date.year in invoices_year
+            ):
+                result += 1
+                # increase current date by month to get invoice to date
+                next_to_date = add_to_date(start_date, months=1)
+                self.create_past_missing_invoices(
+                    from_date=start_date, to_date=next_to_date
+                )
+                print(f"invoice created from date {start_date} to date {next_to_date}")
+
+            # Move to the next month
+            start_date = add_to_date(start_date, months=1)
+
+
+# @frappe.whitelist(allow_guest=True)
+# def is_invoice_exist():
+#     start_date = getdate("01-01-2024")
+#     current_date = getdate(nowdate())
+
+#     while start_date < current_date:
+#         pass
+
+#     return type(current_date)
+
+
 def is_prorate() -> int:
     return cint(frappe.db.get_single_value("Subscription Settings", "prorate"))

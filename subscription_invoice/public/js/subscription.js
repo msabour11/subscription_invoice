@@ -3,8 +3,7 @@ frappe.ui.form.on("Subscription", {
     frm.add_custom_button(
       "Get Past invoices",
       function () {
-   
-        frm.call("generate_invoices_to_today").then((r) => {
+        frm.call("fetch_past_subscription_invoices").then((r) => {
           if (!r.exec) {
             frm.reload_doc();
             console.log("invoices", r.message);
